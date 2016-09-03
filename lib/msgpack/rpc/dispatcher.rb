@@ -16,34 +16,26 @@
 #    limitations under the License.
 #
 module MessagePack
-module RPC
+  module RPC
+    module Dispatcher; end
 
+    class ObjectDispatcher
+      include Dispatcher
 
-module Dispatcher
-end
+      def initialize(obj, accept = obj.public_methods)
+        @obj = obj
+        @accept = accept.map {|m| m.is_a?(Integer) ? m : m.to_s }
+      end
 
+      def dispatch(method, param, &block)
+        unless @accept.include?(method)
+          raise NoMethodError, "method `#{method}' is not accepted"
+        end
+        @obj.send(method, *param, &block)
+      end
+    end
 
-class ObjectDispatcher
-	include Dispatcher
-
-	def initialize(obj, accept = obj.public_methods)
-		@obj = obj
-		@accept = accept.map {|m| m.is_a?(Integer) ? m : m.to_s }
-	end
-
-	def dispatch(method, param, &block)
-		unless @accept.include?(method)
-			raise NoMethodError, "method `#{method}' is not accepted"
-		end
-		@obj.send(method, *param, &block)
-	end
-end
-
-
-#:nodoc:
-class MethodForwarder
-end
-
-
-end
+    #:nodoc:
+    class MethodForwarder; end
+  end
 end

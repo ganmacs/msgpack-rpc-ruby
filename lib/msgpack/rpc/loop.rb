@@ -16,72 +16,68 @@
 #    limitations under the License.
 #
 module MessagePack
-module RPC
+  module RPC
+    Loop = Cool.io::Loop
 
+    module LoopUtil
+      attr_reader :loop
 
-Loop = Cool.io::Loop
+      class Timer < Cool.io::TimerWatcher
+        def initialize(interval, repeating, &block)
+          @block = block
+          super(interval, repeating)
+        end
 
+        def on_timer
+          @block.call
+        end
+      end
 
-module LoopUtil
-	attr_reader :loop
+      def start_timer(interval, repeating, &block)
+        @loop.attach Timer.new(interval, repeating, &block)
+      end
 
-	class Timer < Cool.io::TimerWatcher
-		def initialize(interval, repeating, &block)
-			@block = block
-			super(interval, repeating)
-		end
-		def on_timer
-			@block.call
-		end
-	end
+      class TaskQueue < Cool.io::AsyncWatcher
+        def initialize
+          @queue = []
+          super
+        end
 
-	def start_timer(interval, repeating, &block)
-		@loop.attach Timer.new(interval, repeating, &block)
-	end
+        def push(task)
+          @queue.push(task)
+          signal
+        end
 
-	class TaskQueue < Cool.io::AsyncWatcher
-		def initialize
-			@queue = []
-			super
-		end
+        def on_signal
+          while task = @queue.shift
+            begin
+              task.call
+            rescue
+            end
+          end
+        end
+      end
 
-		def push(task)
-			@queue.push(task)
-			signal
-		end
+      def submit(task = nil, &block)
+        task ||= block
+        unless @queue
+          @queue = TaskQueue.new
+          @loop.attach(@queue)
+        end
+        @queue.push(task)
+      end
 
-		def on_signal
-			while task = @queue.shift
-				begin
-					task.call
-				rescue
-				end
-			end
-		end
-	end
+      def run
+        @loop.run
+      end
 
-	def submit(task = nil, &block)
-		task ||= block
-		unless @queue
-			@queue = TaskQueue.new
-			@loop.attach(@queue)
-		end
-		@queue.push(task)
-	end
-
-	def run
-		@loop.run
-	end
-
-	def stop
-		@queue.detach if @queue && @queue.attached?
-		@loop.stop
-		# attach dummy timer
-		@loop.attach Cool.io::TimerWatcher.new(0, false)
-		nil
-	end
-end
-
-
-end
+      def stop
+        @queue.detach if @queue && @queue.attached?
+        @loop.stop
+        # attach dummy timer
+        @loop.attach Cool.io::TimerWatcher.new(0, false)
+        nil
+      end
+    end
+  end
 end

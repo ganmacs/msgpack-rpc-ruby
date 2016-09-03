@@ -16,234 +16,230 @@
 #    limitations under the License.
 #
 module MessagePack
-module RPC
+  module RPC
+    class TCPTransport
+      def initialize
+        @reconnect_limit = 5 # FIXME default reconnect_limit
+      end
 
+      attr_accessor :reconnect_limit
 
-class TCPTransport
-	def initialize
-		@reconnect_limit = 5   # FIXME default reconnect_limit
-	end
+      # Transport interface
+      def build_transport(session, address)
+        TCPClientTransport.new(session, address, @reconnect_limit)
+      end
 
-	attr_accessor :reconnect_limit
+      class BasicSocket < Cool.io::TCPSocket
+        def initialize(io)
+          super(io)
+          @pac = MessagePack::Unpacker.new
+        end
 
-	# Transport interface
-	def build_transport(session, address)
-		TCPClientTransport.new(session, address, @reconnect_limit)
-	end
+        # from Cool.io::TCPSocket
+        def on_readable
+          super
+        rescue
+          # FIXME send Connection Close message
+          # FIXME log
+          close
+        end
 
-	class BasicSocket < Cool.io::TCPSocket
-		def initialize(io)
-			super(io)
-			@pac = MessagePack::Unpacker.new
-		end
+        # from Cool.io::TCPSocket
+        def on_read(data)
+          @pac.feed_each(data) {|obj|
+            on_message(obj)
+          }
+        end
 
-		# from Cool.io::TCPSocket
-		def on_readable
-			super
-		rescue
-			# FIXME send Connection Close message
-			# FIXME log
-			close
-		end
+        include MessageReceiver
+      end
+    end
 
-		# from Cool.io::TCPSocket
-		def on_read(data)
-			@pac.feed_each(data) {|obj|
-				on_message(obj)
-			}
-		end
+    class TCPClientTransport
+      def initialize(session, address, reconnect_limit)
+        @session = session
+        @address = address
 
-		include MessageReceiver
-	end
-end
+        @pending = ""
+        @sockpool = []
+        @connecting = 0
+        @reconnect_limit = reconnect_limit
+      end
 
+      # ClientTransport interface
+      def send_data(data)
+        if @sockpool.empty?
+          if @connecting == 0
+            try_connect
+            @connecting = 1
+          end
+          @pending << data
+        else
+          # FIXME pesudo connection load balance
+          # sock = @sockpool.choice
+          sock = @sockpool.first
+          sock.send_data(data)
+        end
+      end
 
-class TCPClientTransport
-	def initialize(session, address, reconnect_limit)
-		@session = session
-		@address = address
+      # ClientTransport interface
+      def close
+        @sockpool.reject! {|sock|
+          sock.detach if sock.attached?
+          sock.close
+          true
+        }
+        @sockpool = []
+        @connecting = 0
+        @pending = ""
+        self
+      end
 
-		@pending = ""
-		@sockpool = []
-		@connecting = 0
-		@reconnect_limit = reconnect_limit
-	end
+      # from TCPClientTransport::ClientSocket::on_connect
+      def on_connect(sock)
+        @sockpool.push(sock)
+        sock.send_pending(@pending)
+        @pending = ""
+        @connecting = 0
+      end
 
-	# ClientTransport interface
-	def send_data(data)
-		if @sockpool.empty?
-			if @connecting == 0
-				try_connect
-				@connecting = 1
-			end
-			@pending << data
-		else
-			# FIXME pesudo connection load balance
-			# sock = @sockpool.choice
-			sock = @sockpool.first
-			sock.send_data(data)
-		end
-	end
+      # from TCPClientTransport::ClientSocket::on_connect_failed
+      def on_connect_failed(sock)
+        if @connecting < @reconnect_limit
+          try_connect
+          @connecting += 1
+        else
+          @connecting = 0
+          @pending = ""
+          @session.on_connect_failed
+        end
+      end
 
-	# ClientTransport interface
-	def close
-		@sockpool.reject! {|sock|
-			sock.detach if sock.attached?
-			sock.close
-			true
-		}
-		@sockpool = []
-		@connecting = 0
-		@pending = ""
-		self
-	end
+      # from TCPClientTransport::ClientSocket::on_close
+      def on_close(sock)
+        @sockpool.delete(sock)
+      end
 
-	# from TCPClientTransport::ClientSocket::on_connect
-	def on_connect(sock)
-		@sockpool.push(sock)
-		sock.send_pending(@pending)
-		@pending = ""
-		@connecting = 0
-	end
+      private
 
-	# from TCPClientTransport::ClientSocket::on_connect_failed
-	def on_connect_failed(sock)
-		if @connecting < @reconnect_limit
-			try_connect
-			@connecting += 1
-		else
-			@connecting = 0
-			@pending = ""
-			@session.on_connect_failed
-		end
-	end
+      def try_connect
+        host, port = *@address
+        sock = ClientSocket.connect(host, port, self, @session) # async connect
+        @session.loop.attach(sock)
+      end
 
-	# from TCPClientTransport::ClientSocket::on_close
-	def on_close(sock)
-		@sockpool.delete(sock)
-	end
+      class ClientSocket < TCPTransport::BasicSocket
+        def initialize(io, transport, session)
+          super(io)
+          @t = transport
+          @s = session
+        end
 
-	private
-	def try_connect
-		host, port = *@address
-		sock = ClientSocket.connect(host, port, self, @session)  # async connect
-		@session.loop.attach(sock)
-	end
+        # MessageSendable interface
+        def send_data(data)
+          write data
+        end
 
-	class ClientSocket < TCPTransport::BasicSocket
-		def initialize(io, transport, session)
-			super(io)
-			@t = transport
-			@s = session
-		end
+        # from TCPClientTransport::on_connect
+        def send_pending(data)
+          write data
+        end
 
-		# MessageSendable interface
-		def send_data(data)
-			write data
-		end
+        # MessageReceiver interface
+        def on_request(msgid, method, param)
+          raise Error.new("request message on client session")
+        end
 
-		# from TCPClientTransport::on_connect
-		def send_pending(data)
-			write data
-		end
+        # MessageReceiver interface
+        def on_notify(method, param)
+          raise Error.new("notify message on client session")
+        end
 
-		# MessageReceiver interface
-		def on_request(msgid, method, param)
-			raise Error.new("request message on client session")
-		end
+        # MessageReceiver interface
+        def on_response(msgid, error, result)
+          @s.on_response(self, msgid, error, result)
+        end
 
-		# MessageReceiver interface
-		def on_notify(method, param)
-			raise Error.new("notify message on client session")
-		end
+        # from Cool.io::TCPSocket
+        def on_connect
+          return unless @t
+          @t.on_connect(self)
+        end
 
-		# MessageReceiver interface
-		def on_response(msgid, error, result)
-			@s.on_response(self, msgid, error, result)
-		end
+        # from Cool.io::TCPSocket
+        def on_connect_failed
+          return unless @t
+          @t.on_connect_failed(self)
+        rescue
+          nil
+        end
 
-		# from Cool.io::TCPSocket
-		def on_connect
-			return unless @t
-			@t.on_connect(self)
-		end
+        # from Cool.io::TCPSocket
+        def on_close
+          return unless @t
+          @t.on_close(self)
+          @t = nil
+          @s = nil
+        rescue
+          nil
+        end
+      end
+    end
 
-		# from Cool.io::TCPSocket
-		def on_connect_failed
-			return unless @t
-			@t.on_connect_failed(self)
-		rescue
-			nil
-		end
+    class TCPServerTransport
+      def initialize(address)
+        @address = address
+        @lsock = nil
+      end
 
-		# from Cool.io::TCPSocket
-		def on_close
-			return unless @t
-			@t.on_close(self)
-			@t = nil
-			@s = nil
-		rescue
-			nil
-		end
-	end
-end
+      # ServerTransport interface
+      def listen(server)
+        @server = server
+        host, port = *@address.unpack
+        @lsock = Cool.io::TCPServer.new(host, port, ServerSocket, @server)
+        begin
+          @server.loop.attach(@lsock)
+        rescue
+          @lsock.close
+          raise
+        end
+      end
 
+      # ServerTransport interface
+      def close
+        return unless @lsock
+        @lsock.detach if @lsock.attached?
+        @lsock.close
+      end
 
-class TCPServerTransport
-	def initialize(address)
-		@address = address
-		@lsock = nil
-	end
+      private
 
-	# ServerTransport interface
-	def listen(server)
-		@server = server
-		host, port = *@address.unpack
-		@lsock  = Cool.io::TCPServer.new(host, port, ServerSocket, @server)
-		begin
-			@server.loop.attach(@lsock)
-		rescue
-			@lsock.close
-			raise
-		end
-	end
+      class ServerSocket < TCPTransport::BasicSocket
+        def initialize(io, server)
+          super(io)
+          @server = server
+        end
 
-	# ServerTransport interface
-	def close
-		return unless @lsock
-		@lsock.detach if @lsock.attached?
-		@lsock.close
-	end
+        # MessageSendable interface
+        def send_data(data)
+          write data
+        end
 
-	private
-	class ServerSocket < TCPTransport::BasicSocket
-		def initialize(io, server)
-			super(io)
-			@server = server
-		end
+        # MessageReceiver interface
+        def on_request(msgid, method, param)
+          @server.on_request(self, msgid, method, param)
+        end
 
-		# MessageSendable interface
-		def send_data(data)
-			write data
-		end
+        # MessageReceiver interface
+        def on_notify(method, param)
+          @server.on_notify(method, param)
+        end
 
-		# MessageReceiver interface
-		def on_request(msgid, method, param)
-			@server.on_request(self, msgid, method, param)
-		end
-
-		# MessageReceiver interface
-		def on_notify(method, param)
-			@server.on_notify(method, param)
-		end
-
-		# MessageReceiver interface
-		def on_response(msgid, error, result)
-			raise Error.new("response message on server session")
-		end
-	end
-end
-
-
-end
+        # MessageReceiver interface
+        def on_response(msgid, error, result)
+          raise Error.new("response message on server session")
+        end
+      end
+    end
+  end
 end
